@@ -1,0 +1,17 @@
+{
+  "_comment": "範本：複製成 portfolio.json 並依實際持倉修改。check_stocks.py 只讀 stocks 區塊；shares=0 視為追蹤標的（不計入小計）。",
+  "portfolio": {
+    "stocks": [
+      { "ticker": "0050",   "name": "元大台灣50",       "shares": 100,   "avg_price_twd": 90.00,   "total_cost_twd": 9000.00   },
+      { "ticker": "0056",   "name": "元大高股息",        "shares": 5000,  "avg_price_twd": 35.00,   "total_cost_twd": 175000.00 },
+      { "ticker": "00878",  "name": "國泰永續高股息",    "shares": 5000,  "avg_price_twd": 22.00,   "total_cost_twd": 110000.00 },
+      { "ticker": "2330",   "name": "台積電",            "shares": 100,   "avg_price_twd": 1500.00, "total_cost_twd": 150000.00 },
+      { "ticker": "2412",   "name": "中華電",            "shares": 1000,  "avg_price_twd": 110.00,  "total_cost_twd": 110000.00 },
+      { "ticker": "2886",   "name": "兆豐金",            "shares": 5000,  "avg_price_twd": 32.00,   "total_cost_twd": 160000.00 },
+      { "ticker": "2892",   "name": "第一金",            "shares": 5000,  "avg_price_twd": 22.00,   "total_cost_twd": 110000.00 },
+
+      { "ticker": "2454",   "name": "聯發科",            "shares": 0,     "avg_price_twd": 0,       "total_cost_twd": 0          },
+      { "ticker": "8299",   "name": "群聯",              "shares": 0,     "avg_price_twd": 0,       "total_cost_twd": 0          }
+    ]
+  }
+}

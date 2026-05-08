@@ -1,0 +1,8 @@
+.claude/
+.venv/
+__pycache__/
+*.pyc
+twstock_result.txt
+history.json
+history_stocks.json
+watchlist.txt

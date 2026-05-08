@@ -1,0 +1,24 @@
+# 訊號掃描清單（一行一個 ticker，# 後為註解）
+# 用法: cp watchlist.txt.sample watchlist.txt 修改後
+#       python3 scan_signals.py            # 預設讀 watchlist.txt
+#       python3 scan_signals.py -f xxx.txt # 指定檔案
+
+# AI / 半導體
+2330    # 台積電
+2454    # 聯發科
+3661    # 世芯-KY
+6531    # 愛普
+8299    # 群聯（上櫃）
+
+# 內需 / 傳產
+2207    # 和泰車
+2412    # 中華電
+1101    # 台泥
+
+# 金融
+2884    # 玉山金
+2891    # 中信金
+
+# 記憶體相關
+2344    # 華邦電
+3260    # 威剛
