@@ -6,6 +6,7 @@ import argparse
 import json
 import math
 import re
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from datetime import date, datetime, timezone, timedelta
@@ -25,6 +26,7 @@ def _valid_float(v) -> float | None:
 
 PORTFOLIO_PATH = Path(__file__).parent / "portfolio.json"
 HISTORY_PATH   = Path(__file__).parent / "history_stocks.json"
+DATA_DIR       = Path(__file__).parent / "data"
 HISTORY_KEEP   = 30
 SESSION = requests.Session()
 SESSION.headers["User-Agent"] = "Mozilla/5.0"
@@ -210,6 +212,31 @@ REALTIME_SOURCES = {
 }
 
 
+def get_twse_intraday(ticker: str) -> dict | None:
+    """Today's intraday OHLC + volume from TWSE MIS (only source exposing OHLC).
+    Returns {date, open, high, low, close, volume} or None.
+    Volume converted 張→股 (×1000) to match CMoney units."""
+    ex_ch = f"tse_{ticker}.tw|otc_{ticker}.tw"
+    try:
+        r = SESSION.get(TWSE_API, params={"ex_ch": ex_ch, "json": "1", "delay": "0"}, timeout=10)
+        for item in r.json().get("msgArray", []):
+            if item.get("c") != ticker:
+                continue
+            d = item.get("d") or ""
+            o = _valid_float(item.get("o"))
+            h = _valid_float(item.get("h"))
+            lo = _valid_float(item.get("l"))
+            z = _valid_float(item.get("z"))
+            v = _valid_float(item.get("v"))
+            if not d or None in (o, h, lo, z):
+                return None
+            return {"date": d, "open": o, "high": h, "low": lo, "close": z,
+                    "volume": int((v or 0) * 1000)}
+    except Exception:
+        pass
+    return None
+
+
 # ── K-line chart ─────────────────────────────────────────────────────────────
 
 def get_daily_kline(ticker: str) -> list[tuple[str, float, float, float, float]]:
@@ -314,6 +341,196 @@ def _fetch_daily_full(ticker: str) -> list[list]:
         return []
 
 
+def get_realtime_bar(ticker: str, source: str = "anue") -> dict | None:
+    """Synthesize today's bar from a realtime quote (price + prev_close).
+    open=prev_close, close=price, high/low=max/min(price, prev). volume unknown→0.
+    Returns {date, open, high, low, close, volume, _source} or None."""
+    label, fetcher = REALTIME_SOURCES.get(source, REALTIME_SOURCES["anue"])
+    quote = fetcher([ticker]).get(ticker)
+    if quote is None:
+        return None
+    price, prev = quote
+    return {
+        "date": date.today().strftime("%Y%m%d"),
+        "open": float(prev), "high": float(max(price, prev)),
+        "low":  float(min(price, prev)), "close": float(price),
+        "volume": 0, "_source": label,
+    }
+
+
+def fetch_kline_with_intraday(ticker: str, realtime_source: str = "anue") -> tuple[list[list], list[tuple], dict | None]:
+    """Fetch CMoney historical + splice today's bar so the chart always ends at today.
+    Today's bar priority: TWSE MIS (real OHLC) → realtime quote (synth from price+prev_close).
+    Returns (full_rows_for_save, ohlc_for_drawing, today_bar_or_None).
+    - full_rows: CMoney historical only (completed bars; safe to persist)
+    - ohlc_for_drawing: includes today's bar appended if CMoney lacks today
+    - today_bar: spliced bar dict (with _source label), or None"""
+    full_rows = _fetch_daily_full(ticker)
+    ohlc = [(r[0], float(r[1]), float(r[2]), float(r[3]), float(r[4])) for r in full_rows]
+    today_str = date.today().strftime("%Y%m%d")
+    if ohlc and ohlc[-1][0] == today_str:
+        return full_rows, ohlc, None
+    today_bar = get_twse_intraday(ticker)
+    if today_bar and today_bar["date"] == today_str:
+        today_bar["_source"] = "TWSE MIS"
+    else:
+        today_bar = get_realtime_bar(ticker, realtime_source)
+    if today_bar and today_bar["date"] == today_str:
+        ohlc.append((today_bar["date"], today_bar["open"], today_bar["high"],
+                     today_bar["low"], today_bar["close"]))
+        return full_rows, ohlc, today_bar
+    return full_rows, ohlc, None
+
+
+# TWSE STOCK_DAY: per-month OHLCV history (TSE listed only, no foreign flow).
+# Used to backfill older bars beyond CMoney's ~250-day window.
+TWSE_HISTORY_API = "https://www.twse.com.tw/exchangeReport/STOCK_DAY"
+TPEX_HISTORY_API = "https://www.tpex.org.tw/web/stock/aftertrading/daily_trading_info/st43_result.php"
+
+
+def _roc_to_iso(roc: str) -> str:
+    """民國日期 '114/05/13' → '20250513'. Returns '' on parse failure."""
+    parts = roc.strip().split("/")
+    if len(parts) != 3: return ""
+    try:
+        y, m, d = int(parts[0]) + 1911, int(parts[1]), int(parts[2])
+        return f"{y:04d}{m:02d}{d:02d}"
+    except ValueError:
+        return ""
+
+
+def _fetch_twse_month(ticker: str, y: int, m: int) -> list[list]:
+    """One month OHLCV from TWSE STOCK_DAY (TSE). Returns [[date, O, H, L, C, vol, 0, 0], ...]."""
+    try:
+        r = SESSION.get(TWSE_HISTORY_API, params={
+            "date": f"{y:04d}{m:02d}01", "stockNo": ticker, "response": "json"
+        }, timeout=15)
+        d = r.json()
+        if d.get("stat") != "OK": return []
+        rows = []
+        for row in d.get("data", []):
+            iso = _roc_to_iso(row[0])
+            if not iso: continue
+            try:
+                vol = int(row[1].replace(",", ""))
+                op  = float(row[3].replace(",", ""))
+                hi  = float(row[4].replace(",", ""))
+                lo  = float(row[5].replace(",", ""))
+                cl  = float(row[6].replace(",", ""))
+                rows.append([iso, op, hi, lo, cl, vol, 0, 0])
+            except (ValueError, IndexError):
+                continue
+        return rows
+    except Exception:
+        return []
+
+
+def _fetch_tpex_month(ticker: str, y: int, m: int) -> list[list]:
+    """One month OHLCV from TPEx (上櫃). Returns same shape as _fetch_twse_month."""
+    try:
+        r = SESSION.get(TPEX_HISTORY_API, params={
+            "l": "zh-tw", "d": f"{y - 1911}/{m:02d}", "stkno": ticker,
+            "_": str(int(time.time() * 1000))
+        }, timeout=15)
+        d = r.json()
+        rows = []
+        for row in d.get("aaData", []):
+            iso = _roc_to_iso(row[0])
+            if not iso: continue
+            try:
+                vol = int(row[1].replace(",", ""))
+                op  = float(row[3].replace(",", ""))
+                hi  = float(row[4].replace(",", ""))
+                lo  = float(row[5].replace(",", ""))
+                cl  = float(row[6].replace(",", ""))
+                rows.append([iso, op, hi, lo, cl, vol, 0, 0])
+            except (ValueError, IndexError):
+                continue
+        return rows
+    except Exception:
+        return []
+
+
+def fetch_history_long(ticker: str, days: int) -> list[list]:
+    """Backfill multi-year OHLCV by iterating TWSE STOCK_DAY (or TPEx) monthly.
+    Returns rows sorted ascending; no foreign flow (zeros). Rate-limited ~0.3s/req.
+    First month decides venue (TSE vs OTC); subsequent months reuse that fetcher."""
+    today = date.today()
+    months_needed = max(2, days // 20 + 2)  # ~20 trading days/month + buffer
+    fetcher = _fetch_twse_month
+    rows: list[list] = []
+    used_tpex = False
+    for i in range(months_needed):
+        y = today.year
+        m = today.month - i
+        while m <= 0:
+            m += 12; y -= 1
+        month_rows = fetcher(ticker, y, m)
+        if i == 0 and not month_rows:
+            month_rows = _fetch_tpex_month(ticker, y, m)
+            if month_rows:
+                fetcher = _fetch_tpex_month
+                used_tpex = True
+        rows.extend(month_rows)
+        time.sleep(0.3)
+    rows.sort(key=lambda r: r[0])
+    seen = set()
+    out = []
+    for r in rows:
+        if r[0] in seen: continue
+        seen.add(r[0])
+        out.append(r)
+    if not out:
+        print(f"  ⚠ TWSE/TPEx 都查不到 {ticker} 的歷史資料")
+    elif used_tpex:
+        print(f"  ⓘ {ticker} 用 TPEx (上櫃) 資料源")
+    return out[-days:]
+
+
+def save_kline_history(ticker: str, full_rows: list[list], days: int) -> tuple[int, int]:
+    """Save last `days` of OHLCV + foreign flow as structured JSON to ./data/<ticker>.json.
+    For days ≤ ~250: CMoney only (with foreign flow).
+    For days > 250: TWSE/TPEx backfill (no foreign flow on older bars) merged with
+    CMoney on the recent overlap (CMoney wins on overlap so foreign flow is preserved)."""
+    DATA_DIR.mkdir(exist_ok=True)
+    if days <= len(full_rows):
+        rows_slice = full_rows[-days:]
+        source = "cmoney_5389"
+    else:
+        print(f"  ⓘ 需要 {days} 日，CMoney 僅 {len(full_rows)} 日 — 從 TWSE 回填較舊資料 "
+              f"({(days - len(full_rows)) // 20 + 2} 個月 API 請求，~{((days - len(full_rows)) // 20 + 2) * 0.3:.0f}s)")
+        long_rows = fetch_history_long(ticker, days)
+        by_date = {r[0]: r for r in long_rows}
+        for r in full_rows:
+            by_date[r[0]] = r  # CMoney overrides TWSE for overlap (preserves foreign flow)
+        rows_slice = sorted(by_date.values(), key=lambda r: r[0])[-days:]
+        source = "twse_stock_day+cmoney_5389"
+    structured = []
+    for r in rows_slice:
+        try:
+            structured.append({
+                "date": r[0],
+                "open": float(r[1]), "high": float(r[2]),
+                "low":  float(r[3]), "close": float(r[4]),
+                "volume":       int(float(r[5] or 0)),
+                "foreign_buy":  int(float(r[6] or 0)),
+                "foreign_sell": int(float(r[7] or 0)),
+            })
+        except (ValueError, TypeError, IndexError):
+            continue
+    payload = {
+        "ticker": ticker,
+        "source": source,
+        "fetched_at": datetime.now(TW_TZ).isoformat(timespec="seconds"),
+        "days_requested": days,
+        "days_returned": len(structured),
+        "rows": structured,
+    }
+    out = DATA_DIR / f"{ticker}.json"
+    out.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    return days, len(structured)
+
+
 # Cache market-wide PE/PB (one fetch per run)
 _pe_pb_cache: dict[str, tuple[float, float]] | None = None
 
@@ -416,6 +633,14 @@ def compute_signal(ticker: str) -> dict:
     win30_l = min(c[3] for c in ohlc[-30:])
     pos = (close - win30_l) / (win30_h - win30_l) if win30_h > win30_l else 0.5
 
+    # 5-day price change & foreign flow decay rate (for MOMENTUM detection)
+    chg_5d = (close / closes[-6] - 1) * 100 if len(closes) >= 6 else 0.0
+    if abs(fx_30d / 30) > 0.01:
+        fx_decay = (fx_5d / 5) / (fx_30d / 30) * 100
+    else:
+        fx_decay = None
+    ma60_dist = (close / ma60 - 1) * 100 if ma60 else None
+
     # V2 BUY conditions
     cond_j_rebound = (j_min_5 < 20) and (j >= 20) and (j > j_prev)
     cond_bottom    = pos <= 0.33
@@ -428,11 +653,31 @@ def compute_signal(ticker: str) -> dict:
     cond_ma150_ok  = ma150 is not None and close >= ma150
     is_strong = is_buy and cond_ma200_ok and cond_ma150_ok
 
+    # MOMENTUM (+HOT) — backtest 驗證的動能突破訊號（牛市中應跟進，非減碼）
+    # 條件：急漲 + 遠離 MA60 + 外資累積但動能消失（主力推動完成）+ 量爆 + J 接近 HOT
+    cond_momentum = (
+        chg_5d > 8 and
+        ma60_dist is not None and ma60_dist > 12 and
+        fx_30d > 5 and
+        fx_decay is not None and fx_decay < 30 and
+        vol_ratio > 1.25 and
+        j > 75
+    )
+
     # Downtrend warning (orthogonal — can pair with BUY/WATCH/None)
     downtrend = ma200_slope is not None and ma200_slope < -0.1
 
-    if j > 80 and ma10 is not None and close > ma10:
-        status, note = "HOT", "超買 + 站上 MA10"
+    if cond_momentum:
+        status, note = "MOMENTUM", f"動能突破 (5日 {chg_5d:+.1f}% / 量比 {vol_ratio:.0%})"
+    elif j > 80 and ma10 is not None and close > ma10:
+        notes = ["超買 + 站上 MA10"]
+        if ma60_slope >= 0.5:
+            notes.append("✓ 多頭續行")
+        elif ma60_slope < -0.1:
+            notes.append("⚠ 中期轉弱")
+        if fx_5d < -2:
+            notes.append("⚠ 外資 5 日轉賣")
+        status, note = "HOT", " / ".join(notes)
     elif is_strong:
         status, note = "STRONG_BUY", "V2 + MA200不跌 + ≥MA150"
     elif is_buy:
@@ -450,10 +695,11 @@ def compute_signal(ticker: str) -> dict:
         status, note = None, ""
 
     val = compute_valuation(ticker)
+    ma60_dist = (close / ma60 - 1) * 100 if ma60 else None
     return {
         "ticker": ticker, "close": close, "j": j,
         "ma10": ma10, "ma30": ma30, "ma60": ma60, "ma150": ma150, "ma200": ma200,
-        "ma60_slope": ma60_slope, "ma200_slope": ma200_slope,
+        "ma60_slope": ma60_slope, "ma200_slope": ma200_slope, "ma60_dist": ma60_dist,
         "fx_5d": fx_5d, "fx_30d": fx_30d, "vol_ratio": vol_ratio, "pos30d": pos,
         "downtrend": downtrend, "status": status, "note": note,
         "pe": val["pe"], "pb": val["pb"], "roe": val["roe"], "grade": val["grade"],
@@ -466,6 +712,7 @@ def fmt_signal(status: str | None, width: int = 5) -> str:
     if status == "STRONG_BUY": return f"{_RED}{_BOLD}{'+BUY':>{width}}{_RESET}"
     if status == "BUY":        return f"{_RED}{'BUY':>{width}}{_RESET}"
     if status == "WATCH":      return f"{_CYA}{'WATCH':>{width}}{_RESET}"
+    if status == "MOMENTUM":   return f"{_RED}{_BOLD}{'+HOT':>{width}}{_RESET}"
     if status == "HOT":        return f"{_GREEN}{'HOT':>{width}}{_RESET}"
     return f"{'─':>{width}}"
 
@@ -598,6 +845,72 @@ def draw_kline(ticker: str, full_ohlc: list[tuple[str, float, float, float, floa
     print()
     _draw_j_panel(J_view, n)
     print()
+    _draw_recent_prices(ohlc, days=10)
+    print()
+    _draw_action_hints(ohlc, ma10, ma20, ma30, ma60, ma120, J_view)
+    print()
+
+
+def _draw_recent_prices(ohlc: list[tuple], days: int = 10) -> None:
+    rows = ohlc[-days:]
+    if not rows: return
+    col_w = 7
+    print(f"  近 {len(rows)} 日價格")
+    date_cells = [f"{r[0][4:6]}/{r[0][6:8]}" for r in rows]
+    print("   日期 " + " ".join(f"{c:>{col_w}}" for c in date_cells))
+    closes = [r[4] for r in rows]
+    cells = []
+    for i, c in enumerate(closes):
+        prev = closes[i-1] if i > 0 else c
+        padded = f"{c:g}".rjust(col_w)
+        if   c > prev: cells.append(f"{_RED}{padded}{_RESET}")
+        elif c < prev: cells.append(f"{_GREEN}{padded}{_RESET}")
+        else:          cells.append(padded)
+    print("   收盤 " + " ".join(cells))
+
+
+def _draw_action_hints(ohlc: list[tuple], ma10, ma20, ma30, ma60, ma120, J_view) -> None:
+    c = ohlc[-1][4]
+    mas = [("MA10", ma10[-1] if ma10 else None, _YEL),
+           ("MA20", ma20[-1] if ma20 else None, _CYA),
+           ("MA30", ma30[-1] if ma30 else None, _MAG),
+           ("MA60", ma60[-1] if ma60 else None, _BLU),
+           ("MA120", ma120[-1] if ma120 else None, _WHT)]
+    mas = [(l, v, col) for l, v, col in mas if v is not None]
+    print("  動作建議")
+    pos = []
+    for label, v, col in mas:
+        d = (c / v - 1) * 100
+        sym, sc = ("↑", _RED) if c >= v else ("↓", _GREEN)
+        pos.append(f"{sc}{sym}{label}{d:+.1f}%{_RESET}")
+    print(f"   目前 {c:g}  " + "  ".join(pos))
+    res = sorted([(l, v) for l, v, _ in mas if v > c], key=lambda x: x[1])
+    sup = sorted([(l, v) for l, v, _ in mas if v <= c], key=lambda x: x[1], reverse=True)
+    if res:
+        print(f"   壓力 " + " > ".join(f"{l} {v:.2f}" for l, v in res))
+    if sup:
+        print(f"   支撐 " + " > ".join(f"{l} {v:.2f}" for l, v in sup))
+    print()
+    if res:
+        l, v = res[0]
+        print(f"   ▲ 站回 {v:.0f} ({l}) → 動能未斷，續抱")
+    if sup and len(sup) >= 1:
+        l, v = sup[0]
+        print(f"   ◆ 守住 {v:.0f} ({l}) → 維持多頭結構，觀察")
+    ma30_v = ma30[-1] if ma30 else None
+    ma60_v = ma60[-1] if ma60 else None
+    if ma30_v and c > ma30_v:
+        print(f"   ▼ 跌破 {ma30_v:.0f} (MA30) → 動能轉弱，減碼 1/3")
+    if ma60_v and c > ma60_v:
+        print(f"   ✕ 跌破 {ma60_v:.0f} (MA60) → 趨勢反轉，全出")
+    j = J_view[-1] if J_view else None
+    if j is not None:
+        if j > 80:
+            print(f"   ⚠ J={j:.0f} 超買（強多頭中可鈍化 2-4 週；HOT 框架：看 MA60 斜率 + 外資 判讀）")
+        elif j < 20:
+            print(f"   ⚠ J={j:.0f} 超賣（等 BUY 條件：J 反彈 + 量縮 + 外資 5日 ≥ -2億）")
+        else:
+            print(f"   J={j:.0f} 中性")
 
 
 # ── CLI ──────────────────────────────────────────────────────────────────────
@@ -605,7 +918,7 @@ def draw_kline(ticker: str, full_ohlc: list[tuple[str, float, float, float, floa
 def parse_args():
     p = argparse.ArgumentParser(
         description="台股投資組合損益查詢工具（純股票，不含基金）",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
+        formatter_class=argparse.RawTextHelpFormatter,
         epilog="""\
 範例：
   python3 check_stocks.py                     即時報價損益表（台股）
@@ -614,30 +927,69 @@ def parse_args():
   python3 check_stocks.py -d                  當年度台股股利
   python3 check_stocks.py -k 00981A           畫該股 60 日 K 線
   python3 check_stocks.py -k 2412 -n 90       中華電 90 日 K 線
+  python3 check_stocks.py -k 2330 --download-history 250
+                                              畫 K 線並把最近 250 日歷史存到 ./data/2330.json
   python3 check_stocks.py --backfill          回填 30 個交易日股票部位歷史
   python3 check_stocks.py --backfill 2026-04-15  回填指定單日
   python3 check_stocks.py -s pnl-pct          依損益% 排序
 """,
     )
     p.add_argument("-s", "--sort", choices=["pnl-pct", "pnl-value", "change", "change-pct"],
-                   metavar="{pnl-pct,pnl-value,change,change-pct}",
+                   metavar="SORTBY",
                    default=None,
-                   help="排序（由高到低）")
+                   help="排序（由高到低）。可用值：\n"
+                        "\n"
+                        "    pnl-pct      損益%% 由高到低\n"
+                        "    pnl-value    損益金額（台幣）由高到低\n"
+                        "    change       漲跌金額由高到低（需 -r 模式）\n"
+                        "    change-pct   漲跌幅%% 由高到低（需 -r 模式）\n")
     p.add_argument("-d", "--dividends", action="store_true",
-                   help="僅顯示當年度台股股利（已除息 ＋ 即將除息）")
+                   help="僅顯示當年度台股股利（已除息 ＋ 即將除息），不查股價。\n")
     p.add_argument("-r", "--realtime", action="store_true",
-                   help="即時報價模式（含漲跌欄；預設模式無漲跌欄）")
+                   help="即時報價模式：用盤中即時價取代昨日收盤，多顯示\n"
+                        "「現價/漲跌/漲跌幅」欄與技術欄（J/MA30/訊號）；\n"
+                        "預設模式無此欄位。\n")
     p.add_argument("-S", "--source", choices=list(REALTIME_SOURCES.keys()),
+                   metavar="SOURCE",
                    default="anue",
-                   help="即時報價資料源（預設 anue）：anue=鉅亨 cnyes、twse=TWSE MIS、cmoney=CMoney")
+                   help="即時報價資料源（預設 anue；影響 -r 與 -k 今日 bar fallback）。\n"
+                        "可用值：\n"
+                        "\n"
+                        "    anue      鉅亨 cnyes，單次批次最穩（預設）\n"
+                        "    twse      TWSE MIS，官方來源，盤後可能無資料\n"
+                        "    cmoney    CMoney，單檔請求需 cmkey\n")
     p.add_argument("-k", "--kline", metavar="TICKER",
-                   help="畫指定股票的日 K 線圖（紅漲綠跌）")
-    p.add_argument("-n", "--days", type=int, default=60,
-                   help="K 線天數（預設 60，搭配 -k）")
-    p.add_argument("--backfill", nargs='?', const='30', metavar='DAYS|YYYY-MM-DD',
-                   help="回填股票部位 grand total 到 history_stocks.json")
+                   help="畫指定股票的日 K 線圖（紅漲綠跌）。K 線末端會自動拼接\n"
+                        "今日即時 bar（TWSE MIS 真 OHLC，失敗 fallback 到 --source\n"
+                        "合成）。下方附「近 10 日價格表」與「動作建議」。\n")
+    p.add_argument("-n", "--days", type=int, default=60, metavar="DAYS",
+                   help="K 線天數（預設 60；搭配 -k；資料來源最多回傳約 250 日）。\n")
+    p.add_argument("--download-history", type=int, metavar="DAYS",
+                   help="搭配 -k：把該股最近 DAYS 日歷史資料（OHLCV ＋ 外資買賣超）\n"
+                        "存到 ./data/<TICKER>.json，可供回測重複讀取。\n"
+                        "資料來源依 DAYS 大小自動切換：\n"
+                        "\n"
+                        "    DAYS ≤ 250    CMoney 一次拿齊（含外資籌碼）\n"
+                        "    DAYS > 250    TWSE STOCK_DAY 按月回填 ＋ CMoney 補近期外資\n"
+                        "                  （可撈 5 年以上 ≈ 1250 日，無外資的舊 bar 補 0）\n"
+                        "\n"
+                        "今日合成 bar 不入檔，僅 completed bars。\n")
+    p.add_argument("--backfill", nargs='?', const='30', metavar='ARG',
+                   help="回填股票部位 grand total 到 history_stocks.json。\n"
+                        "可用值：\n"
+                        "\n"
+                        "    (無參數)        回填過去 30 個交易日\n"
+                        "    N               回填過去 N 個交易日（整數）\n"
+                        "    YYYY-MM-DD      回填指定單日\n")
     p.add_argument("--signals", action="store_true",
-                   help="掃描持股+追蹤股的進場/出場訊號（J/MA60/外資籌碼綜合判斷）")
+                   help="掃描 portfolio.json 內持股 ＋ 追蹤股的進場/出場訊號。\n"
+                        "訊號類型：\n"
+                        "\n"
+                        "    +BUY     BUY ＋ MA200 不下跌 ＋ 收盤 ≥ MA150（最強）\n"
+                        "    BUY      J 從 <20 反彈 ＋ 底部 1/3 ＋ 外資不撤 ＋ 量縮\n"
+                        "    +HOT     急漲 ＋ M60 距離大 ＋ 量爆 ＋ 籌碼動能（多頭續抱）\n"
+                        "    HOT      J>80 ＋ 收盤>MA10（短線超買）\n"
+                        "    WATCH    J<20 但 BUY 條件未湊齊\n")
     return p.parse_args()
 
 
@@ -730,41 +1082,44 @@ def scan_signals(tickers: list[str], names: dict | None = None) -> list[dict]:
 def print_signals_table(signals: list[dict], title: str = "進場訊號掃描") -> None:
     """Render signals table with CJK-aware visual width alignment."""
     # Column widths (visual cols)
-    W_T, W_N, W_C, W_J, W_M, W_S, W_F, W_F2, W_V, W_SIG = 8, 20, 8, 4, 7, 8, 8, 9, 7, 5
+    W_T, W_N, W_C, W_J, W_M, W_D, W_S, W_F, W_F2, W_V, W_SIG = 8, 20, 8, 4, 7, 8, 8, 8, 9, 7, 5
 
-    print(f"\n{'═'*120}")
+    print(f"\n{'═'*128}")
     print(f"  {title}")
     print(f"  條件: +BUY = BUY + MA200 不下跌 + 收盤 ≥ MA150 (中長期多頭結構，最強)")
     print(f"        BUY  = J 從 <20 反彈 + 收盤位於 30 日底部 1/3 + 外資 5日 ≥ -2億 + 量縮 (5/30日比 ≤ 80%)")
     print(f"        WATCH = J<20 但 BUY 條件未湊齊 (J 未反彈 / 非底部 / 外資賣超 / 量未縮)")
-    print(f"        HOT  = J>80 + 收盤>MA10 (短線過熱，注意減碼)")
+    print(f"        +HOT = 急漲(>8%) + 遠離 MA60(>12%) + 外資衰退率<30% + 量爆 + J>75 (動能突破，多頭續抱)")
+    print(f"        HOT  = J>80 + 收盤>MA10 (短線超買；HOT note 會附 MA60 斜率與外資狀態)")
     print(f"        ⚠ MA200 下降警示會附在 BUY 後（提示中長期結構偏弱）")
     print(f"  估值: 評分 = PE 桶(0-4) + ROE 桶(0-4)，A=7-8, B=5-6, C=3-4, D=0-2；ROE = PB / PE × 100%")
     print(f"        PE  桶: ≤12→4, ≤18→3, ≤25→2, ≤40→1, >40→0；ROE 桶: >25%→4, >15→3, >10→2, >5→1, ≤5→0")
     print(f"        F=虧損(PE≤0), ─=ETF/無資料")
-    print(f"{'═'*120}")
+    print(f"  M60距: (收盤 / MA60 - 1)，正值=站上均線，負值=跌破均線；±2% 內為「貼線」")
+    print(f"{'═'*128}")
     SEP = " "  # single-space gap between columns
     # Header (all CJK-aware)
     print("  " + cjk_ljust('代號', W_T) + cjk_ljust('股名', W_N)
           + cjk_rjust('收盤', W_C) + SEP + cjk_rjust('J', W_J) + SEP
           + cjk_rjust('MA30', W_M) + SEP + cjk_rjust('MA60', W_M) + SEP
-          + cjk_rjust('M60斜率', W_S) + SEP + cjk_rjust('外資5d', W_F) + SEP
-          + cjk_rjust('外資30d', W_F2) + SEP + cjk_rjust('估值', W_V)
+          + cjk_rjust('M60距', W_D) + SEP + cjk_rjust('M60斜率', W_S) + SEP
+          + cjk_rjust('外資5d', W_F) + SEP + cjk_rjust('外資30d', W_F2) + SEP
+          + cjk_rjust('估值', W_V)
           + "  " + cjk_rjust('訊號', W_SIG) + "  說明")
     sep_line = ("  " + "─"*W_T + "─"*W_N + "─"*W_C + " " + "─"*W_J + " "
-                + "─"*W_M + " " + "─"*W_M + " " + "─"*W_S + " " + "─"*W_F + " "
-                + "─"*W_F2 + " " + "─"*W_V + "  " + "─"*W_SIG + "  " + "─"*30)
+                + "─"*W_M + " " + "─"*W_M + " " + "─"*W_D + " " + "─"*W_S + " "
+                + "─"*W_F + " " + "─"*W_F2 + " " + "─"*W_V + "  " + "─"*W_SIG + "  " + "─"*30)
     print(sep_line)
 
-    order = {"BUY": 0, "WATCH": 1, "HOT": 2, None: 3}
-    signals.sort(key=lambda x: (order.get(x.get("status"), 4), x.get("ticker", "")))
+    order = {"STRONG_BUY": 0, "BUY": 1, "MOMENTUM": 2, "WATCH": 3, "HOT": 4, None: 5}
+    signals.sort(key=lambda x: (order.get(x.get("status"), 6), x.get("ticker", "")))
 
     for sig in signals:
         t = sig.get("ticker", "")
         n = sig.get("name", "")
         # Insufficient data row: span numeric cols with ─
         if sig.get("status") is None and not sig.get("close"):
-            blank = " " * (W_C + W_J + W_M + W_M + W_S + W_F + W_F2 + W_V + 7)  # 7 = inter-column spaces
+            blank = " " * (W_C + W_J + W_M + W_M + W_D + W_S + W_F + W_F2 + W_V + 8)  # 8 = inter-column spaces
             print("  " + cjk_ljust(t, W_T) + cjk_ljust(n, W_N) + blank
                   + "  " + colored_cell("─", "", W_SIG) + "  " + sig.get('note', ''))
             continue
@@ -773,6 +1128,7 @@ def print_signals_table(signals: list[dict], title: str = "進場訊號掃描") 
         j = sig.get("j", 50)
         ma30 = sig.get("ma30", 0) or 0
         ma60 = sig.get("ma60", 0) or 0
+        ma60_dist = sig.get("ma60_dist")
         slope = sig.get("ma60_slope", 0)
         fx5 = sig.get("fx_5d", 0)
         fx30 = sig.get("fx_30d", 0)
@@ -785,6 +1141,13 @@ def print_signals_table(signals: list[dict], title: str = "進場訊號掃描") 
         j_cell = colored_cell(f"{j:.0f}", j_color, W_J)
         ma30_cell = cjk_rjust(f"{ma30:.2f}", W_M)
         ma60_cell = cjk_rjust(f"{ma60:.2f}", W_M)
+        # M60距 cell: red if above (bullish), green if below (bearish);
+        # near-line (|dist| ≤ 2%) shown without color emphasis.
+        if ma60_dist is None:
+            dist_cell = cjk_rjust("─", W_D)
+        else:
+            dist_color = _RED if ma60_dist > 2 else (_GREEN if ma60_dist < -2 else "")
+            dist_cell = colored_cell(f"{ma60_dist:+.2f}%", dist_color, W_D)
         slope_color = _RED if slope > 0 else (_GREEN if slope < -0.1 else "")
         slope_cell = colored_cell(f"{slope:+.2f}%", slope_color, W_S)
         fx5_color = _RED if fx5 > 0 else (_GREEN if fx5 < -2 else "")
@@ -796,14 +1159,16 @@ def print_signals_table(signals: list[dict], title: str = "進場訊號掃描") 
         SEP = " "
         print("  " + cjk_ljust(t, W_T) + cjk_ljust(n, W_N)
               + close_cell + SEP + j_cell + SEP + ma30_cell + SEP + ma60_cell + SEP
-              + slope_cell + SEP + fx5_cell + SEP + fx30_cell + SEP + val_cell
-              + "  " + sig_cell + "  " + note)
+              + dist_cell + SEP + slope_cell + SEP + fx5_cell + SEP + fx30_cell + SEP
+              + val_cell + "  " + sig_cell + "  " + note)
 
-    print(f"{'═'*120}")
-    n_buy = sum(1 for s in signals if s.get("status") == "BUY")
-    n_watch = sum(1 for s in signals if s.get("status") == "WATCH")
-    n_hot = sum(1 for s in signals if s.get("status") == "HOT")
-    print(f"  訊號統計: BUY={n_buy}, WATCH={n_watch}, HOT={n_hot}, 共掃 {len(signals)} 檔\n")
+    print(f"{'═'*128}")
+    n_strong = sum(1 for s in signals if s.get("status") == "STRONG_BUY")
+    n_buy    = sum(1 for s in signals if s.get("status") == "BUY")
+    n_mom    = sum(1 for s in signals if s.get("status") == "MOMENTUM")
+    n_watch  = sum(1 for s in signals if s.get("status") == "WATCH")
+    n_hot    = sum(1 for s in signals if s.get("status") == "HOT")
+    print(f"  訊號統計: +BUY={n_strong}, BUY={n_buy}, +HOT={n_mom}, WATCH={n_watch}, HOT={n_hot}, 共掃 {len(signals)} 檔\n")
 
 
 # ── Main ─────────────────────────────────────────────────────────────────────
@@ -813,8 +1178,13 @@ def main():
 
     # K-line mode (no portfolio needed)
     if args.kline:
-        ohlc = get_daily_kline(args.kline)
+        full_rows, ohlc, _ = fetch_kline_with_intraday(args.kline, args.source)
         draw_kline(args.kline, ohlc, days=args.days, height=22)
+        if args.download_history:
+            req, got = save_kline_history(args.kline, full_rows, args.download_history)
+            print(f"✓ Saved {got} days of {args.kline} → ./data/{args.kline}.json")
+            if got < req:
+                print(f"  ⚠ 實際回傳 {got} 日（< 要求 {req}）— 可能該股上市未滿，或 TWSE 也沒更早資料")
         return
 
     # Signals mode
